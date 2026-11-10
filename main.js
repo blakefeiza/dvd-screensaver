@@ -12,22 +12,20 @@
   var PATTERNS = [[3, 2], [2, 3], [5, 3], [3, 4], [4, 3], [5, 4], [4, 5], [7, 5]];
 
   var canvas, ctx, W = 0, H = 0;
-  var totalSales = null;
-  // Each cycle gets a random length and pattern, so corner hits are not on a fixed beat.
-  var MIN_CYCLE = 12, MAX_CYCLE = 45;
-  var schedule = [];
-  function cycleAt(i) {
-    while (schedule.length <= i) {
-      var n = schedule.length;
-      var prev = n ? schedule[n - 1] : null;
-      var pi;
-      do { pi = Math.floor(Math.random() * PATTERNS.length); } while (prev && pi === prev.pi);
-      var dur = n === 0 ? CYCLE_SECONDS : MIN_CYCLE + Math.random() * (MAX_CYCLE - MIN_CYCLE);
-      schedule.push({ start: prev ? prev.start + prev.dur : 0, dur: dur, pi: pi });
-    }
-    return schedule[i];
+  var kpis = fallbackKpis();
+  // Steady pace: the logo always moves at SPEED px/s along its path. Each cycle is one bounce pattern that
+  // ends in a corner (so every lap still ends in a corner hit); a longer pattern simply takes longer.
+  var SPEED = 230;                 // px per second at 1x
+  var SPEED_STEPS = [1, 1.4, 1.9, 2.6]; // click the logo to step up; after the top step it goes back to 1x
+  var speedIdx = 0;
+  var cycle = 0, phase = 0, patIdx = 0, flipX = 0, flipY = 0, lastT = null;
+  var logoX = 0, logoY = 0;
+  function nextPattern() {
+    var pi;
+    do { pi = Math.floor(Math.random() * PATTERNS.length); } while (pi === patIdx);
+    patIdx = pi;
   }
-  var startTime = performance.now() - (CYCLE_SECONDS - FIRST_HIT_SECONDS) * 1000;
+  patIdx = 0; // first lap is the short [3,2] pattern so the first corner hit comes quickly
   var lastCycle = 0, colorIdx = 0, lastBounceKey = '';
   var particles = [], flashUntil = 0;
 
@@ -37,8 +35,13 @@
     window.addEventListener('resize', resize);
     resize();
     requestAnimationFrame(frame);
+    canvas.addEventListener('pointerdown', onPointerDown);
+    canvas.addEventListener('pointermove', onPointerMove);
     if (window.tableau && tableau.extensions) {
-      tableau.extensions.initializeAsync().then(loadSales, function () {});
+      tableau.extensions.initializeAsync().then(function () {
+        loadKpis();
+        tableau.extensions.worksheetContent.worksheet.addEventListener(tableau.TableauEventType.SummaryDataChanged, loadKpis);
+      }, function () {});
     }
   };
 
@@ -47,32 +50,52 @@
     H = canvas.height = window.innerHeight;
   }
 
-  function loadSales() {
-    var ws = [tableau.extensions.worksheetContent.worksheet];
-    var pending = ws.length, found = null;
-    ws.forEach(function (sheet) {
-      sheet.getSummaryDataAsync().then(function (dt) {
-        var idx = -1;
-        dt.columns.forEach(function (c, i) {
-          if (idx < 0 && /sales/i.test(c.fieldName)) idx = i;
-        });
-        if (idx >= 0 && found === null) {
-          var sum = 0;
-          dt.data.forEach(function (row) {
-            var v = Number(row[idx].value);
-            if (!isNaN(v)) sum += v;
-          });
-          found = sum;
-          totalSales = sum;
+  // ---- KPIs shown in the corner-hit popup ----
+  // Inside Tableau (Desktop, Cloud, Server): every measure dragged onto the extension's Marks card.
+  // Anywhere else (GitHub Pages, Tableau Public Web Page object): ?label=..&value=.. in the URL, else the Superstore total.
+  var AGG_WORDS = { SUM: 'Total', AVG: 'Average', MIN: 'Min', MAX: 'Max', CNT: 'Count of', CNTD: 'Distinct count of', MEDIAN: 'Median', AGG: '', STDEV: 'Std dev of', VAR: 'Variance of' };
+  var MEASURE_RE = /^(SUM|AVG|MIN|MAX|CNT|CNTD|MEDIAN|AGG|STDEV|VAR)\((.*)\)$/i;
+
+  function fallbackKpis() {
+    var q = new URLSearchParams(window.location.search), out = [];
+    ['', '2', '3'].forEach(function (n) {
+      var l = q.get('label' + n), v = q.get('value' + n);
+      if (l && v) out.push({ label: l, value: v });
+    });
+    return out.length ? out : [{ label: 'Total Sales', value: '$2,326,534' }];
+  }
+
+  function formatLike(sample, num) {
+    // keep the prefix and suffix of Tableau's own formatting ($, %, k ...) around a re-summed number
+    var m = /^([^0-9\-.]*)([\-0-9.,]+)(.*)$/.exec(sample || '');
+    var dec = m && /\.(\d+)/.test(m[2]) ? /\.(\d+)/.exec(m[2])[1].length : 0;
+    if (m && m[3].indexOf('%') >= 0) { num = num * 100; if (dec === 0 && Math.abs(num) < 10) dec = 1; } // 0.15 shown as 15%
+    var body = num.toLocaleString('en-US', { minimumFractionDigits: dec, maximumFractionDigits: dec });
+    return (m ? m[1] : '') + body + (m ? m[3] : '');
+  }
+
+  function loadKpis() {
+    var sheet = tableau.extensions.worksheetContent.worksheet;
+    sheet.getSummaryDataAsync({ ignoreSelection: true }).then(function (dt) {
+      var out = [];
+      dt.columns.forEach(function (c, i) {
+        var m = MEASURE_RE.exec(c.fieldName);
+        if (!m || out.length >= 3) return;
+        var rows = dt.data, word = AGG_WORDS[m[1].toUpperCase()], value;
+        if (rows.length === 1) {
+          value = rows[0][i].formattedValue;
+        } else {
+          var nums = rows.map(function (r) { return Number(r[i].value); }).filter(function (v) { return !isNaN(v); });
+          if (!nums.length) return;
+          var total = nums.reduce(function (s, v) { return s + v; }, 0);
+          var agg = m[1].toUpperCase();
+          var n = agg === 'AVG' || agg === 'MEDIAN' ? total / nums.length : agg === 'MIN' ? Math.min.apply(null, nums) : agg === 'MAX' ? Math.max.apply(null, nums) : total;
+          value = formatLike(rows[0][i].formattedValue, n);
         }
-      }).catch(function () {}).then(function () {
-        if (--pending === 0 && found === null) totalSales = null;
+        out.push({ label: (word ? word + ' ' : '') + m[2], value: value });
       });
-    });
-    // Refresh when the data changes.
-    ws.forEach(function (sheet) {
-      sheet.addEventListener(tableau.TableauEventType.SummaryDataChanged, loadSales);
-    });
+      kpis = out.length ? out : [{ label: 'Drag a measure onto the Marks card', value: '' }];
+    }).catch(function () {});
   }
 
   function tri(s, L) { // 0 -> L -> 0 triangle wave, starts at 0
@@ -81,24 +104,38 @@
     return L - Math.abs(p - L);
   }
 
-  function frame(now) {
-    var t = (now - startTime) / 1000;
-    var cycle = 0;
-    while (cycleAt(cycle).start + cycleAt(cycle).dur <= t) cycle++;
-    var cur = cycleAt(cycle);
-    var phase = (t - cur.start) / cur.dur;
-    var pat = PATTERNS[cur.pi];
-    var maxX = Math.max(1, W - LOGO_W), maxY = Math.max(1, H - LOGO_H);
-    var sx = pat[0] * maxX * phase, sy = pat[1] * maxY * phase;
-    // Each cycle ends in a corner; start the next one from that corner, heading away,
-    // instead of snapping back to the top left. Odd bounce counts flip the start side.
-    var flipX = 0, flipY = 0;
-    for (var c = 0; c < cycle; c++) {
-      var pc = PATTERNS[cycleAt(c).pi];
-      flipX ^= pc[0] & 1;
-      flipY ^= pc[1] & 1;
+  function onPointerMove(e) {
+    var r = canvas.getBoundingClientRect(), px = e.clientX - r.left, py = e.clientY - r.top;
+    canvas.style.cursor = (px >= logoX && px <= logoX + LOGO_W && py >= logoY && py <= logoY + LOGO_H) ? 'pointer' : 'default';
+  }
+  function onPointerDown(e) {
+    var r = canvas.getBoundingClientRect(), px = e.clientX - r.left, py = e.clientY - r.top;
+    if (px >= logoX && px <= logoX + LOGO_W && py >= logoY && py <= logoY + LOGO_H) {
+      speedIdx = (speedIdx + 1) % SPEED_STEPS.length;
+      speedBadgeUntil = performance.now() + 1500;
     }
+  }
+  var speedBadgeUntil = 0;
+
+  function frame(now) {
+    var dt = lastT === null ? 0 : Math.min(0.1, (now - lastT) / 1000);
+    lastT = now;
+    var maxX = Math.max(1, W - LOGO_W), maxY = Math.max(1, H - LOGO_H);
+    var pat = PATTERNS[patIdx];
+    var len = Math.sqrt(Math.pow(pat[0] * maxX, 2) + Math.pow(pat[1] * maxY, 2));
+    if (lastCycle === 0 && cycle === 0 && lastT !== null && phase === 0 && dt === 0) phase = Math.max(0, 1 - (6 * SPEED) / len); // first corner hit about 6 s in
+    phase += (SPEED * SPEED_STEPS[speedIdx] * dt) / len;
+    if (phase >= 1) { // reached the corner: start the next lap from it, heading away
+      phase -= 1;
+      flipX ^= pat[0] & 1;
+      flipY ^= pat[1] & 1;
+      cycle++;
+      nextPattern();
+    }
+    pat = PATTERNS[patIdx];
+    var sx = pat[0] * maxX * phase, sy = pat[1] * maxY * phase;
     var x = tri(sx + (flipX ? maxX : 0), maxX), y = tri(sy + (flipY ? maxY : 0), maxY);
+    logoX = x; logoY = y;
 
     if (cycle !== lastCycle) { // wrapped past a corner hit
       lastCycle = cycle;
@@ -115,6 +152,7 @@
     drawLogo(x, y, COLORS[colorIdx]);
     drawConfetti();
     drawFlash(now);
+    drawSpeedBadge(now);
     requestAnimationFrame(frame);
   }
 
@@ -167,35 +205,43 @@
     });
   }
 
+  function drawSpeedBadge(now) {
+    if (now > speedBadgeUntil) return;
+    ctx.save();
+    ctx.font = 'bold 14px Arial, sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,.85)';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText('Speed ' + SPEED_STEPS[speedIdx].toFixed(1) + 'x', 14, 12);
+    ctx.restore();
+  }
+
   function drawFlash(now) {
     if (now > flashUntil) return;
     // Blink ~3x per second.
     if (Math.floor(now / 170) % 2 === 0) return;
-    var big = totalSales === null ? '' : formatMoney(totalSales);
-    var size = Math.max(28, Math.min(W / 7, H / 3.5));
+    var n = Math.max(1, kpis.length);
+    var size = Math.max(24, Math.min(W / 7, H / (3.5 + n * 0.9)) / (n > 1 ? 1.25 : 1)); // value size shrinks as KPIs are added
     var small = size * 0.4;
+    var block = n * (small + size) * 1.15;
+    var top = H / 2 - block / 2 - small * 0.9;
     ctx.save();
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.lineJoin = 'round';
     ctx.strokeStyle = '#000';
-    ctx.lineWidth = small / 5;
-    ctx.font = '900 ' + small + 'px Arial Black, Arial, sans-serif';
-    ctx.fillStyle = '#ff2d92';
-    ctx.strokeText('CORNER HIT!', W / 2, H / 2 - size * 0.75);
-    ctx.fillText('CORNER HIT!', W / 2, H / 2 - size * 0.75);
-    ctx.fillStyle = '#fff';
-    ctx.strokeText('TOTAL SALES', W / 2, H / 2 - size * 0.3);
-    ctx.fillText('TOTAL SALES', W / 2, H / 2 - size * 0.3);
-    ctx.font = '900 ' + size + 'px Arial Black, Arial, sans-serif';
-    ctx.lineWidth = size / 12;
-    ctx.fillStyle = '#ffd60a';
-    ctx.strokeText(big, W / 2, H / 2 + size * 0.45);
-    ctx.fillText(big, W / 2, H / 2 + size * 0.45);
+    function line(txt, font, fill, lw, y) {
+      ctx.font = font; ctx.fillStyle = fill; ctx.lineWidth = lw;
+      ctx.strokeText(txt, W / 2, y); ctx.fillText(txt, W / 2, y);
+    }
+    line('CORNER HIT!', '900 ' + small + 'px Arial Black, Arial, sans-serif', '#ff2d92', small / 5, top);
+    var y = top + small * 1.2;
+    kpis.forEach(function (k) {
+      line(String(k.label).toUpperCase(), '900 ' + small + 'px Arial Black, Arial, sans-serif', '#fff', small / 5, y);
+      y += small * 0.2 + size * 0.55;
+      if (k.value !== '') line(String(k.value), '900 ' + size + 'px Arial Black, Arial, sans-serif', '#ffd60a', size / 12, y);
+      y += size * 0.75;
+    });
     ctx.restore();
-  }
-
-  function formatMoney(v) {
-    return '$' + Math.round(v).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   }
 })();
