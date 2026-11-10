@@ -12,7 +12,6 @@
   var PATTERNS = [[3, 2], [2, 3], [5, 3], [3, 4], [4, 3], [5, 4], [4, 5], [7, 5]];
 
   var canvas, ctx, W = 0, H = 0;
-  var kpis = fallbackKpis();
   // Steady pace: the logo always moves at SPEED px/s along its path. Each cycle is one bounce pattern that
   // ends in a corner (so every lap still ends in a corner hit); a longer pattern simply takes longer.
   var SPEED = 230;                 // px per second at 1x
@@ -37,12 +36,6 @@
     requestAnimationFrame(frame);
     canvas.addEventListener('pointerdown', onPointerDown);
     canvas.addEventListener('pointermove', onPointerMove);
-    if (window.tableau && tableau.extensions) {
-      tableau.extensions.initializeAsync().then(function () {
-        loadKpis();
-        tableau.extensions.worksheetContent.worksheet.addEventListener(tableau.TableauEventType.SummaryDataChanged, loadKpis);
-      }, function () {});
-    }
   };
 
   function resize() {
@@ -50,53 +43,9 @@
     H = canvas.height = window.innerHeight;
   }
 
-  // ---- KPIs shown in the corner-hit popup ----
-  // Inside Tableau (Desktop, Cloud, Server): every measure dragged onto the extension's Marks card.
-  // Anywhere else (GitHub Pages, Tableau Public Web Page object): ?label=..&value=.. in the URL, else the Superstore total.
-  var AGG_WORDS = { SUM: 'Total', AVG: 'Average', MIN: 'Min', MAX: 'Max', CNT: 'Count of', CNTD: 'Distinct count of', MEDIAN: 'Median', AGG: '', STDEV: 'Std dev of', VAR: 'Variance of' };
-  var MEASURE_RE = /^(SUM|AVG|MIN|MAX|CNT|CNTD|MEDIAN|AGG|STDEV|VAR)\((.*)\)$/i;
-
-  function fallbackKpis() {
-    var q = new URLSearchParams(window.location.search), out = [];
-    ['', '2', '3'].forEach(function (n) {
-      var l = q.get('label' + n), v = q.get('value' + n);
-      if (l && v) out.push({ label: l, value: v });
-    });
-    return out.length ? out : [{ label: 'Total Sales', value: '$2,326,534' }];
-  }
-
-  function formatLike(sample, num) {
-    // keep the prefix and suffix of Tableau's own formatting ($, %, k ...) around a re-summed number
-    var m = /^([^0-9\-.]*)([\-0-9.,]+)(.*)$/.exec(sample || '');
-    var dec = m && /\.(\d+)/.test(m[2]) ? /\.(\d+)/.exec(m[2])[1].length : 0;
-    if (m && m[3].indexOf('%') >= 0) { num = num * 100; if (dec === 0 && Math.abs(num) < 10) dec = 1; } // 0.15 shown as 15%
-    var body = num.toLocaleString('en-US', { minimumFractionDigits: dec, maximumFractionDigits: dec });
-    return (m ? m[1] : '') + body + (m ? m[3] : '');
-  }
-
-  function loadKpis() {
-    var sheet = tableau.extensions.worksheetContent.worksheet;
-    sheet.getSummaryDataAsync({ ignoreSelection: true }).then(function (dt) {
-      var out = [];
-      dt.columns.forEach(function (c, i) {
-        var m = MEASURE_RE.exec(c.fieldName);
-        if (!m || out.length >= 3) return;
-        var rows = dt.data, word = AGG_WORDS[m[1].toUpperCase()], value;
-        if (rows.length === 1) {
-          value = rows[0][i].formattedValue;
-        } else {
-          var nums = rows.map(function (r) { return Number(r[i].value); }).filter(function (v) { return !isNaN(v); });
-          if (!nums.length) return;
-          var total = nums.reduce(function (s, v) { return s + v; }, 0);
-          var agg = m[1].toUpperCase();
-          var n = agg === 'AVG' || agg === 'MEDIAN' ? total / nums.length : agg === 'MIN' ? Math.min.apply(null, nums) : agg === 'MAX' ? Math.max.apply(null, nums) : total;
-          value = formatLike(rows[0][i].formattedValue, n);
-        }
-        out.push({ label: (word ? word + ' ' : '') + m[2], value: value });
-      });
-      kpis = out.length ? out : [{ label: 'Drag a measure onto the Marks card', value: '' }];
-    }).catch(function () {});
-  }
+  // Popup content: fixed, because Tableau Public cannot run extensions or read the workbook.
+  // Total Sales = sum of Sales over the 10,194 Superstore Orders rows.
+  var kpis = [{ label: 'Total Sales', value: '$2,326,534' }];
 
   function tri(s, L) { // 0 -> L -> 0 triangle wave, starts at 0
     if (L <= 0) return 0;
